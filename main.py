@@ -1,72 +1,110 @@
 import os
+import re
 import yt_dlp
 import whisper
-from moviepy.editor import VideoFileClip
-import moviepy.video.fx.all as vfx
+import moviepy.editor as mp
+from moviepy.video.fx.all import crop
+import google.generativeai as genai
+import arabic_reshaper
+from bidi.algorithm import get_display
 
-def download_youtube_video(url, output_name="podcast.mp4"):
-    """1. تحميل الفيديو من يوتيوب"""
-    print("جاري تحميل الفيديو...")
+def fix_arabic_text(text):
+    """تهيئة النص العربي ليظهر متصلاً وصحيحاً على الفيديو"""
+    reshaped_text = arabic_reshaper.reshape(text)
+    return get_display(reshaped_text)
+
+def download_podcast(url):
+    print("\n[1] جاري تحميل البودكاست بجودة مناسبة للريلز...")
     ydl_opts = {
-        'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/mp4',
-        'outtmpl': output_name,
+        'format': 'bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[height<=720][ext=mp4]',
+        'outtmpl': 'podcast.%(ext)s',
+        'merge_output_format': 'mp4'
     }
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         ydl.download([url])
-    return output_name
+    return "podcast.mp4"
 
-def transcribe_audio(video_path):
-    """2. استخراج النص باستخدام Whisper"""
-    print("جاري تفريغ الصوت إلى نص عربي...")
-    model = whisper.load_model("base") # يمكنك استخدام 'small' أو 'medium' لدقة أعلى
-    result = model.transcribe(video_path, language="ar")
-    return result['text'], result['segments']
+def transcribe_audio(file_path):
+    print("\n[2] جاري تفريغ الصوت وتحليل الكلمات...")
+    model = whisper.load_model("base")
+    result = model.transcribe(file_path)
+    return result
 
-def find_best_clips(transcript):
+def get_viral_clips(transcript_text, api_key):
+    print("\n[3] جاري استخراج أفضل المقاطع باستخدام الذكاء الاصطناعي...")
+    genai.configure(api_key=api_key)
+    model = genai.GenerativeModel('gemini-1.5-flash')
+    
+    prompt = f"""
+    أنت خبير في صناعة المحتوى على تيك توك. اقرأ هذا النص المستخرج من بودكاست واستخرج منه أفضل اللحظات 
+    التي تصلح كفيديوهات قصيرة (ريلز) جذابة. 
+    استخرج أكبر عدد ممكن من المقاطع (حتى 100 مقطع إن وُجد).
+    يجب أن تكون مدة المقطع بين 30 إلى 60 ثانية.
+    
+    أريد الإجابة فقط بتنسيق الأوقات بالثواني هكذا:
+    Start-End
+    مثال:
+    15-60
+    120-180
+    
+    النص:
+    {transcript_text}
     """
-    3. تحليل النص لاختيار أفضل المقاطع
-    هنا يتم ربط API الذكاء الاصطناعي (مثل Gemini) لإعطائه النص 
-    والطلب منه إرجاع وقت البداية والنهاية لأفضل دقيقة.
-    (كمثال تجريبي، سنفترض أنه اختار من الدقيقة 1 إلى 2)
-    """
-    print("جاري البحث عن اللحظات الفيروسية...")
-    # يجب استبدال هذا الجزء بنداء لـ LLM API
-    best_clips = [{"start": 60, "end": 120}] 
-    return best_clips
+    
+    response = model.generate_content(prompt)
+    clips = re.findall(r'(\d+)\s*-\s*(\d+)', response.text)
+    return [(int(start), int(end)) for start, end in clips]
 
-def create_reel(video_path, start_time, end_time, output_name):
-    """4. قص الفيديو وتحويله للوضع العمودي (9:16)"""
-    print(f"جاري إنشاء الريل: {output_name}...")
+def create_reels_with_captions(video_path, clips, segments):
+    print(f"\n[4] جاري قص {len(clips)} مقاطع وإضافة الكابشن...")
+    video = mp.VideoFileClip(video_path)
     
-    # تحميل المقطع وقصه
-    clip = VideoFileClip(video_path).subclip(start_time, end_time)
+    # تحويل أبعاد الفيديو إلى 9:16 (تيك توك)
+    w, h = video.size
+    target_w = int(h * 9/16)
+    video = crop(video, width=target_w, height=h, x_center=w/2)
     
-    # حساب أبعاد المنتصف للقص العمودي
-    (w, h) = clip.size
-    target_ratio = 9 / 16
-    new_width = int(h * target_ratio)
-    x_center = w / 2
+    for i, (start, end) in enumerate(clips):
+        if end > video.duration:
+            end = video.duration
+            
+        print(f"جاري إنتاج المقطع رقم {i+1}...")
+        clip = video.subclip(start, end)
+        
+        # استخراج الكابشن الخاص بهذا المقطع
+        text_clips = []
+        for segment in segments:
+            seg_start = segment['start']
+            seg_end = segment['end']
+            
+            if seg_start >= start and seg_end <= end:
+                text = fix_arabic_text(segment['text'])
+                # إنشاء نص الكابشن
+                txt_clip = mp.TextClip(text, fontsize=45, color='white', bg_color='black', font='Arial')
+                txt_clip = txt_clip.set_position(('center', 'bottom')).set_duration(seg_end - seg_start)
+                txt_clip = txt_clip.set_start(seg_start - start)
+                text_clips.append(txt_clip)
+        
+        if text_clips:
+            final_clip = mp.CompositeVideoClip([clip] + text_clips)
+        else:
+            final_clip = clip
+            
+        final_clip.write_videofile(f"reel_{i+1}.mp4", codec="libx264", audio_codec="aac", fps=24, preset="ultrafast")
     
-    # قص الشاشة من المنتصف (Center Crop)
-    cropped_clip = clip.crop(
-        x1=x_center - new_width/2, 
-        y1=0, 
-        x2=x_center + new_width/2, 
-        y2=h
-    )
-    
-    # يمكنك لاحقاً إضافة الكابشنز هنا باستخدام TextClip
-    
-    cropped_clip.write_videofile(output_name, codec="libx264", audio_codec="aac")
-    print("تم الانتهاء بنجاح!")
+    video.close()
+    print("\n✅ تم الانتهاء بنجاح! تفقد مجلد الملفات لتحميل الريلز.")
 
-# مسار التشغيل
 if __name__ == "__main__":
-    youtube_link = input("أدخل رابط البودكاست: ")
+    url = input("أدخل رابط البودكاست من يوتيوب: ")
+    api_key = input("أدخل مفتاح API الخاص بـ Gemini: ")
     
-    video_file = download_youtube_video(youtube_link)
-    transcript, segments = transcribe_audio(video_file)
-    clips = find_best_clips(transcript)
+    video_file = download_podcast(url)
+    transcription = transcribe_audio(video_file)
     
-    for i, clip in enumerate(clips):
-        create_reel(video_file, clip["start"], clip["end"], f"reel_{i+1}.mp4")
+    clips_timestamps = get_viral_clips(transcription['text'], api_key)
+    
+    if not clips_timestamps:
+        print("لم يتمكن الذكاء الاصطناعي من استخراج مقاطع. يرجى التأكد من النص.")
+    else:
+        create_reels_with_captions(video_file, clips_timestamps, transcription['segments'])
